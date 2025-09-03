@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Four animated strategies in a 2x2 grid with:
-  • Better contrast (greens → orange → red at high densities),
-  • Pile spreading: piles are disks capped at rho_cap (no point sinks),
-  • Front-sweep: only the back strip moves each pass; band thickens (capped) and marches forward,
-  • No bagging until raking is complete (so piles/band visibly grow).
+Animated raking + bagging:
+  • 2x2 panels (BF-centers, Front-sweep, Micro-piles, Discrete Opt)
+  • Raking uses same calibrated dynamics as before (outside-in rays, front-strip sweep)
+  • Spillage cap (RHO_CAP) for piles/band during raking
+  • NEW: Bagging phase is visualized after raking finishes
+      - Outside-in panels: bag piles sequentially (left→right); disks shrink
+      - Front-sweep panel: bag from the front edge first (row/column aware);
+        the band thins and retreats from the front
 
-Playback: 1 frame = 1 minute of simulated work; 0.5s per frame (2 fps).
-Saves MP4, falls back to GIF if ffmpeg isn't available.
+Playback: 1 frame = 1 minute; 0.5 s per frame (2 FPS).
+Saves MP4 if ffmpeg is present; otherwise falls back to GIF.
 """
 
 import itertools
-from math import radians, sqrt, pi
+from math import radians, sqrt, pi, ceil
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -24,17 +27,17 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize
 FPS = 2                      # playback speed: 0.5 s per frame
 SECONDS_PER_FRAME = 60       # 1 frame = 1 minute of simulated work
 SAVE_OUTPUT = True
+SHOW_WINDOW = True
+
 OUT_DIR = Path("./outputs")
 OUT_DIR.mkdir(exist_ok=True)
 OUT_PATH = OUT_DIR / "heatmaps_2x2.mp4"
 
-# Visuals: custom colormap with orange/red for highest densities
-# (low values light green → mid green → yellow → orange → red)
+# Visuals: green → yellow → orange → red for rising density
 COLORS = ["#edf8e9", "#a1d99b", "#31a354", "#fed976", "#fd8d3c", "#e31a1c"]
 CMAP = LinearSegmentedColormap.from_list("leaf_hot", COLORS, N=256)
 
-# Physical-ish cap on leaf surface density (lb/ft^2) to force pile spreading
-# (e.g., ~3 lb/ft^3 bulk density × 1 ft height ≈ 3 lb/ft^2)
+# Physical-ish cap on surface density (lb/ft^2) to force spreading
 RHO_CAP = 3.0
 
 # Outside-in ray discretization
@@ -44,7 +47,7 @@ ANGLE_BINS = 24
 FRONT_SWEEP_STRIP_FT = 2.0
 
 # =========================
-# Mock data & yard model (from your original script)
+# Mock data & yard model (from original)
 # =========================
 raking_splits = {10:7, 20:9, 30:13, 40:17, 50:21, 60:28, 70:35, 80:42, 90:49, 100:51}
 bagging_times = {0.25:"1:39", 0.50:"1:45", 0.75:"1:45", 1.00:"2:00"}
@@ -57,10 +60,11 @@ axis_ratio = 1.5
 sigma = 10.0
 rho0, A_amp, p_pow = 0.03, 0.28, 2.0
 
-s = 1.0                      # grid size (ft)
+# grid (ft)
+s = 1.0
 candidate_spacing = 10.0
 K_max = 5
-bag_capacity_lb = 35.0       # bagging deferred; kept for completeness
+bag_capacity_lb = 35.0  # bagging capacity C
 
 # =========================
 # Helpers
@@ -90,7 +94,7 @@ def fit_bag_time(fullness_to_time):
     X = np.vstack([np.ones_like(fracs), fracs, fracs**2]).T
     coef, *_ = np.linalg.lstsq(X, secs, rcond=None)
     s0, s1, s2 = coef
-    if s2 < 0:
+    if s2 < 0:  # keep convex
         s2 = 0.0
         X2 = X[:, :2]
         s0, s1 = np.linalg.lstsq(X2, secs, rcond=None)[0]
@@ -111,11 +115,14 @@ times = [raking_splits[d] for d in distances]
 alpha, beta = fit_power_time(distances, times)
 
 (b0_hat, b1_hat, b2_hat), t_frac = fit_bag_time(bagging_times)
-b0 = t_frac(0.0)
+b0 = t_frac(0.0)  # setup per bag (sec)
 bag_capacity_lb = float(bag_capacity_lb)
+# We use a linear stuffing rate (sec/lb) from mid-fullness; b2 is small and
+# awkward to invert in real time, so bagging dynamics use b1 only for animation:
+b1 = (t_frac(0.8) - t_frac(0.4)) / (0.4 * bag_capacity_lb)
 
 # =========================
-# 2) Build grid & leaf distribution
+# 2) Grid & leaf distribution
 # =========================
 nx, ny = int(L/s), int(W/s)
 xs = np.linspace(s/2, L - s/2, nx)  # x: 0→L
@@ -136,12 +143,12 @@ rho_init = rho0 + A_amp * np.exp(-(R_aniso**p_pow))
 R_circ = np.sqrt(dx**2 + dy**2)
 rho_init = np.where(R_circ < trunk_radius, rho0, rho_init)
 
-m_cell = rho_init * Acell
-masses = m_cell.ravel()
+mass_grid_init = rho_init * Acell
+masses = mass_grid_init.ravel()
 M_total = float(masses.sum())
 
 # =========================
-# 3) Pile centers per strategy
+# 3) Pile centers
 # =========================
 def centers_bf():
     k = max(1, int(round(M_total/(2*bag_capacity_lb))))
@@ -201,7 +208,7 @@ def centers_opt_discrete():
     return centers
 
 # =========================
-# 4) Baseline times for calibration
+# 4) Baselines for calibration
 # =========================
 def baseline_rake_time_to_centers(centers):
     if centers.size == 0:
@@ -215,7 +222,7 @@ def baseline_rake_time_to_front():
     return float(np.sum(alpha * masses * (dfront ** beta)))
 
 # =========================
-# 5) Outside-in radial arrival (calibrated), + per-pile precompute
+# 5) Outside-in raking (calibrated) + pile deposit helper
 # =========================
 def radial_arrival_times_calibrated(centers, angle_bins=24):
     if centers.size == 0:
@@ -253,178 +260,141 @@ def radial_arrival_times_calibrated(centers, angle_bins=24):
             T = np.cumsum(dt)
             t_arrive[ray_idxs] = T
 
-    # calibrate to baseline
+    # calibrate so max arrival == baseline
     raw_total = float(np.nanmax(t_arrive[np.isfinite(t_arrive)])) if np.isfinite(t_arrive).any() else 0.0
     target_total = baseline_rake_time_to_centers(centers)
     scale = (target_total / raw_total) if raw_total > 0 else 1.0
     t_arrive *= scale
 
-    # per-pile arrays for fast mass queries
     per_pile = []
     for p in range(centers.shape[0]):
         mask = (pile_id == p)
-        per_pile.append({
-            "t": t_arrive[mask],
-            "m": masses[mask]
-        })
+        mp = masses[mask]
+        per_pile.append({"t": t_arrive[mask], "m": mp, "M_total": float(mp.sum())})
     return t_arrive, pile_id, per_pile
 
-# disk-deposit with cap (uniform density up to RHO_CAP)
-def deposit_piles_disk(centers, per_pile, t_sec, nx, ny, xs, ys, rho_cap, acell):
-    acc = np.zeros((ny, nx), dtype=float)  # density (lb/ft^2)
+def deposit_pile_disks_from_masses(centers, M_list, nx, ny, xs, ys, rho_cap, acell):
+    """Draw capped disks for given pile masses (used during bagging)."""
+    acc = np.zeros((ny, nx), dtype=float)
+    if centers.size == 0:
+        return acc
+    Xc, Yc = np.meshgrid(xs, ys)
     for p, (cx, cy) in enumerate(centers):
-        tp = per_pile[p]["t"]; mp = per_pile[p]["m"]
-        M = float(mp[tp <= t_sec].sum())  # arrived mass
-        if M <= 0: continue
-        r = sqrt(M / (pi * rho_cap))  # ft
-        # draw uniform disk centered at (cx,cy)
-        Xc, Yc = np.meshgrid(xs, ys)
+        M = float(M_list[p])
+        if M <= 0: 
+            continue
+        r = sqrt(M / (pi * rho_cap))
         mask = (Xc - cx)**2 + (Yc - cy)**2 <= r**2
         area = float(mask.sum()) * acell
-        if area <= 0: continue
-        dens = M / area
-        dens = min(dens, rho_cap)
+        if area <= 0: 
+            continue
+        dens = min(rho_cap, M / area)
         acc[mask] += dens
     return acc
 
+def deposit_piles_disk_from_arrivals(centers, per_pile, t_sec, nx, ny, xs, ys, rho_cap, acell):
+    """(Raking phase) disks from mass arrived by time t."""
+    Ms = []
+    for p in range(len(per_pile)):
+        tp = per_pile[p]["t"]; mp = per_pile[p]["m"]
+        Ms.append(float(mp[tp <= t_sec].sum()))
+    return deposit_pile_disks_from_masses(centers, Ms, nx, ny, xs, ys, rho_cap, acell)
+
 # =========================
-# 6) Front-sweep (active back strip only, band with cap)
+# 6) Front-sweep timing + column-aware spillage (raking)
 # =========================
 def front_sweep_band_mass_time(strip_ft=2.0):
     rows_per = max(1, int(round(strip_ft / s)))
-    mass_per_row_init = (rho_init * Acell).sum(axis=1)  # ny
-    # how many full strip steps until we sweep all rows
     n_steps = int(np.ceil(ny / rows_per))
-    # baseline cumulative times (raw)
     T_raw = []
     raw_total = 0.0
+    mass_per_row_init = mass_grid_init.sum(axis=1)  # ny
     for k in range(n_steps):
         start = max(0, ny - (k+1)*rows_per)
-        end   = ny - 1 - k*rows_per
-        if start > end: continue
-        M_k = float(mass_per_row_init[start:].sum())  # mass above/back of current start
-        dt_k = alpha * M_k * (rows_per * s) ** beta
+        M_above = float(mass_per_row_init[start:].sum())
+        dt_k = alpha * M_above * (rows_per * s) ** beta
         raw_total += dt_k
         T_raw.append(raw_total)
     T_raw = np.array(T_raw, dtype=float)
-    # calibrate to pushing everything to front
     T_target = baseline_rake_time_to_front()
     scale = (T_target / T_raw[-1]) if len(T_raw) and T_raw[-1] > 0 else 1.0
     T_steps = T_raw * scale
     return rows_per, mass_per_row_init, T_steps
 
-def band_snapshot_with_spillage(t_sec, rows_per, mass_per_row_init, T_steps, rho_cap):
-    """
-    Front-sweep with realistic spillage:
-    - Only the active back strip is moved each pass (as before).
-    - The accumulated band mass at time t is distributed across *multiple rows*
-      behind the leading edge, filling each row up to rho_cap before spilling
-      into the next. This avoids a single-row "super spike".
-    """
-    # How many full strips completed?
+def band_snapshot_with_spillage_columns(t_sec, rows_per, mass_per_row_init, T_steps, rho_cap):
+    # Raking phase: like before (column aware)
     k = int(np.searchsorted(T_steps, t_sec, side="right"))
     k = min(k, len(T_steps))
-
-    # How far (rows) the band has advanced toward the front
     adv_rows = k * rows_per
 
-    # Fully swept rows (removed from source)
-    start_full = max(0, ny - adv_rows)
-    M_full = float(mass_per_row_init[start_full:].sum()) if adv_rows > 0 else 0.0
-
-    # Fractional progress in current strip (if any)
-    if k == len(T_steps):      # finished
+    if k == len(T_steps):
         frac = 1.0
     else:
         prev_t = 0.0 if k == 0 else T_steps[k-1]
         dt_k = T_steps[k] - prev_t
         frac = 0.0 if dt_k <= 1e-12 else np.clip((t_sec - prev_t) / dt_k, 0.0, 1.0)
 
-    # Next strip mass that is partially captured into the band
-    next_start = max(0, ny - (adv_rows + rows_per))
-    next_end   = max(-1, ny - adv_rows - 1)
-    M_next = float(mass_per_row_init[next_start:next_end+1].sum()) if next_start <= next_end else 0.0
-
-    # Total mass currently in the traveling band
-    M_band = M_full + frac * M_next
-
-    # Base density = initial rho, minus *swept* rows (they're emptied)
     rho = rho_init.copy()
     if adv_rows > 0:
         rho[ny - adv_rows:, :] = 0.0
-    if next_start <= next_end and frac > 0:
-        rho[next_start:next_end+1, :] *= (1.0 - frac)
 
-    # ---- Spillage deposit: fill rows from the leading edge backward at <= rho_cap ----
-    # Row area (ft^2)
-    A_row = nx * Acell        # = L * s
-    # Max mass that fits in 1 row at the cap
-    K_row = rho_cap * A_row
-
-    # Leading edge row (closest to front)
-    lead_row = max(0, ny - 1 - adv_rows)
-
-    # Distribute M_band across rows [lead_row, lead_row-1, ...] until mass is exhausted
-    M_rem = M_band
-    r = lead_row
-    while M_rem > 1e-12 and r >= 0:
-        # mass we can place in this row without exceeding the cap
-        m_place = min(K_row, M_rem)
-        dens = m_place / A_row           # <= rho_cap by construction
-        rho[r, :] += dens
-        M_rem -= m_place
-        r -= 1
-
-    return rho
-    # progress in strips
-    k = int(np.searchsorted(T_steps, t_sec, side="right"))
-    k = min(k, len(T_steps))
-    # how far (rows) the band has advanced toward the front
-    adv_rows = k * rows_per
-    # cumulative band mass assembled from the back rows
-    # fully swept rows:
-    start_full = max(0, ny - adv_rows)
-    M_full = float(mass_per_row_init[start_full:].sum()) if adv_rows > 0 else 0.0
-    # partially swept next strip:
-    if k == len(T_steps):  # finished
-        frac = 1.0
-    else:
-        prev_t = 0.0 if k == 0 else T_steps[k-1]
-        dt_k = T_steps[k] - prev_t
-        frac = 0.0 if dt_k <= 1e-12 else np.clip((t_sec - prev_t) / dt_k, 0.0, 1.0)
-
-    # next strip (if any)
     next_start = max(0, ny - (adv_rows + rows_per))
     next_end   = max(-1, ny - adv_rows - 1)
-    M_next = float(mass_per_row_init[next_start:next_end+1].sum()) if next_start <= next_end else 0.0
-
-    M_band = M_full + frac * M_next
-
-    # base = initial density; remove the rows that have been swept (no leaves left behind)
-    rho = rho_init.copy()
-    # remove all fully swept rows
-    if adv_rows > 0:
-        rho[ny - adv_rows: , :] = 0.0
-    # remove a fraction of the next strip rows (they are in the band now)
     if next_start <= next_end and frac > 0:
         rho[next_start:next_end+1, :] *= (1.0 - frac)
 
-    # place the band at its current leading edge (toward the front)
-    lead_row = ny - 1 - int(adv_rows)  # index of the band row closest to the front
-    if M_band > 0:
-        # height in feet: H = M/(rho_cap * L); rows = ceil(H/s)
-        H_ft = M_band / (rho_cap * L)
-        h_rows = max(1, int(np.ceil(H_ft / s)))
-        top = max(0, lead_row - h_rows + 1)
-        bot = max(0, lead_row)
-        area = (bot - top + 1) * nx * Acell
-        dens = min(rho_cap, M_band / area) if area > 0 else 0.0
-        rho[top:bot+1, :] += dens
+    # Band mass per column (fully + fractional)
+    M_full_cols = mass_grid_init[ny - adv_rows: ny, :].sum(axis=0) if adv_rows > 0 else np.zeros(nx)
+    M_next_cols = mass_grid_init[next_start:next_end+1, :].sum(axis=0) if next_start <= next_end else np.zeros(nx)
+    M_band_cols = M_full_cols + frac * M_next_cols
+
+    # Place the band starting at the first cleared row (lead_row)
+    lead_row = ny - adv_rows
+    lead_row = min(max(0, lead_row), ny-1)
+
+    K_cell = rho_cap * Acell
+    remaining = M_band_cols.copy()
+    for r in range(lead_row, ny):
+        if np.all(remaining <= 1e-12):
+            break
+        cap_row = np.maximum(0.0, K_cell - rho[r, :] * Acell)
+        place = np.minimum(remaining, cap_row)
+        rho[r, :] += place / Acell
+        remaining -= place
 
     return rho
 
 # =========================
-# 7) Build strategies & schedules
+# 7) Bagging utilities
+# =========================
+def bag_mass_removed(M_total, t, C, b0, b1):
+    """
+    Mass removed after bagging for time t (sec) with:
+      - setup b0 sec per bag (no mass removed during setup),
+      - stuffing rate 1/b1 lb/sec (linear),
+      - capacity C lb/bag,
+    Bags are processed sequentially.
+    """
+    if M_total <= 1e-12 or t <= 0:
+        return 0.0
+    M_rem = M_total
+    t_rem = t
+    removed = 0.0
+    while M_rem > 1e-12 and t_rem > 1e-12:
+        cap = min(C, M_rem)          # mass to fill for this bag
+        if t_rem <= b0:
+            break                    # still in setup, nothing removed
+        t_rem -= b0
+        fill_mass = min(cap, t_rem / b1)
+        removed += fill_mass
+        M_rem   -= fill_mass
+        t_rem   -= fill_mass * b1
+        if fill_mass < cap:
+            break  # partial bag; done
+    return removed
+
+# =========================
+# 8) Build strategies & schedules
 # =========================
 centers_list = [
     centers_bf(),
@@ -434,93 +404,169 @@ centers_list = [
 ]
 
 PANEL_TITLES = [
-    "BF-centers (outside-in, spread)",
-    "Front-sweep: back→front (band spreads)",
-    "Micro-piles (outside-in, spread)",
-    "Optimization (discrete K≤5, spread)",
+    "BF-centers (outside-in, bag after rake)",
+    "Front-sweep (active strip, bag from front)",
+    "Micro-piles (outside-in, bag after rake)",
+    "Optimization (discrete K≤5, bag after rake)",
 ]
 
 # Outside-in schedules (panels 0,2,3)
 radial_data = {}
+rake_total_secs = [0.0]*4
 for idx in [0, 2, 3]:
     t_arrive, pile_of_cell, per_pile = radial_arrival_times_calibrated(centers_list[idx], angle_bins=ANGLE_BINS)
+    rake_total_secs[idx] = float(np.nanmax(t_arrive[np.isfinite(t_arrive)])) if np.isfinite(t_arrive).any() else 0.0
+    # precompute pile totals and bagging plan (sequential, left→right)
+    centers = centers_list[idx]
+    order = np.argsort(centers[:,0]) if centers.size else np.array([], dtype=int)
+    pile_totals = [per_pile[p]["M_total"] for p in range(len(per_pile))]
+    pile_totals = np.array(pile_totals)
+    pile_totals_ordered = pile_totals[order] if pile_totals.size else np.array([])
+    n_bags = np.ceil(pile_totals_ordered / bag_capacity_lb).astype(int) if pile_totals_ordered.size else np.array([])
+    pile_bag_times = n_bags * b0 + (pile_totals_ordered * b1) if n_bags.size else np.array([])
+    pile_bag_cum = np.cumsum(pile_bag_times) if pile_bag_times.size else np.array([])
     radial_data[idx] = {
-        "centers": centers_list[idx],
+        "centers": centers,
         "t_arrive": t_arrive,
-        "pile_of_cell": pile_of_cell,
         "per_pile": per_pile,
+        "order": order,
+        "pile_totals": pile_totals,
+        "pile_bag_times": pile_bag_times,
+        "pile_bag_cum": pile_bag_cum,
     }
 
-# Front-sweep precompute
+# Front-sweep schedule (panel 1)
 rows_per, mass_per_row_init, T_steps = front_sweep_band_mass_time(FRONT_SWEEP_STRIP_FT)
+rake_total_secs[1] = float(T_steps[-1]) if len(T_steps) else 0.0
 
-# Determine total simulated horizon
-def total_seconds_outside_in(sched):
-    ta = sched["t_arrive"]
-    return float(np.nanmax(ta[np.isfinite(ta)])) if np.isfinite(ta).any() else 0.0
+# Precompute final band mass grid at end of raking (for fast bagging snapshots)
+rho_final_band = band_snapshot_with_spillage_columns(rake_total_secs[1], rows_per, mass_per_row_init, T_steps, RHO_CAP)
+mass_final_band = rho_final_band * Acell
+# bagging totals for the band
+M_band_total = float(mass_final_band.sum())
+n_bags_band = int(ceil(M_band_total / bag_capacity_lb))
+bag_total_band = n_bags_band * b0 + b1 * M_band_total
 
-sec_candidates = [
-    total_seconds_outside_in(radial_data[0]),
-    float(T_steps[-1]) if len(T_steps) else 0.0,
-    total_seconds_outside_in(radial_data[2]),
-    total_seconds_outside_in(radial_data[3]),
-]
-total_seconds = max(sec_candidates) if sec_candidates else 0.0
+# =========================
+# 9) Snapshot functions with bagging
+# =========================
+def density_snapshot_outside_in_with_bagging(panel_idx, t_sec):
+    info = radial_data[panel_idx]
+    centers = info["centers"]
+    T_rake = rake_total_secs[panel_idx]
+    if t_sec <= T_rake or centers.size == 0:
+        # raking phase
+        remain = rho_init.copy().ravel()
+        arrived = (info["t_arrive"] <= t_sec)
+        remain[arrived] = 0.0
+        remain = remain.reshape(ny, nx)
+        acc = deposit_piles_disk_from_arrivals(centers, info["per_pile"], t_sec, nx, ny, xs, ys, RHO_CAP, Acell)
+        return remain + acc
+    # bagging phase
+    tau = t_sec - T_rake
+    # compute remaining mass per pile given sequential bagging (left→right)
+    order = info["order"]
+    totals = info["pile_totals"]
+    Ms_rem = totals.copy()
+    if totals.size:
+        cum = info["pile_bag_cum"]
+        bag_times = info["pile_bag_times"]
+        C = bag_capacity_lb
+        # walk piles in order
+        t_left = tau
+        for j, p in enumerate(order):
+            Mj = totals[p]
+            if t_left <= 0:
+                break
+            Tj = bag_times[j]
+            if t_left >= Tj - 1e-12:
+                Ms_rem[p] = 0.0
+                t_left -= Tj
+            else:
+                # partial bagging on this pile
+                removed = bag_mass_removed(Mj, t_left, C, b0, b1)
+                Ms_rem[p] = max(0.0, Mj - removed)
+                t_left = 0.0
+                break
+    # ground is empty once raking finished
+    acc = deposit_pile_disks_from_masses(centers, Ms_rem, nx, ny, xs, ys, RHO_CAP, Acell)
+    return acc
+
+# Precompute front-first order for band bagging (row-major from front y=0 upward)
+band_order = np.argsort(Y.ravel())  # increasing y
+band_cum = None  # we’ll compute prefix sums on the first call
+
+def density_snapshot_front_sweep_with_bagging(t_sec):
+    T_rake = rake_total_secs[1]
+    if t_sec <= T_rake:
+        return band_snapshot_with_spillage_columns(t_sec, rows_per, mass_per_row_init, T_steps, RHO_CAP)
+    # bagging phase (front-first)
+    tau = t_sec - T_rake
+    # mass removed so far (single worker)
+    removed = bag_mass_removed(M_band_total, tau, bag_capacity_lb, b0, b1)
+    removed = min(removed, M_band_total)
+
+    # Starting from final band mass grid, remove 'removed' front-first
+    global band_cum
+    m0 = mass_final_band.ravel().copy()
+    if band_cum is None:
+        m_sorted = m0[band_order]
+        band_cum = np.cumsum(m_sorted)
+    # find cut index
+    idx = np.searchsorted(band_cum, removed, side="right")
+    out = m0.copy()
+    # fully cleared cells
+    if idx > 0:
+        cleared_ids = band_order[:idx]
+        out[cleared_ids] = 0.0
+    # partial cell (the first not fully cleared)
+    if idx < len(band_order):
+        prev_cum = 0.0 if idx == 0 else band_cum[idx-1]
+        need = removed - prev_cum
+        cid = band_order[idx]
+        out[cid] = max(0.0, out[cid] - need)
+    # reshape to density
+    return out.reshape(ny, nx) / Acell
+
+# =========================
+# 10) Timeline (rake + bag)
+# =========================
+# Per-panel totals
+bag_total_secs = [0.0]*4
+for idx in [0, 2, 3]:
+    totals = radial_data[idx]["pile_totals"]
+    if totals.size:
+        n_bags = np.ceil(totals / bag_capacity_lb).astype(int)
+        bag_total_secs[idx] = float((n_bags * b0 + totals * b1).sum())
+    else:
+        bag_total_secs[idx] = 0.0
+bag_total_secs[1] = bag_total_band
+
+panel_total_secs = [rake_total_secs[i] + bag_total_secs[i] for i in range(4)]
+total_seconds = max(panel_total_secs)
 total_minutes = int(np.ceil(total_seconds / 60.0))
 n_frames = max(1, total_minutes + 1)
 
 # =========================
-# 8) Density snapshots per panel
-# =========================
-def density_snapshot_outside_in_spread(panel_idx, t_sec):
-    info = radial_data[panel_idx]
-    centers = info["centers"]
-    t_arrive = info["t_arrive"]
-    # start from initial density, zero out arrived cells
-    remain = rho_init.copy().ravel()
-    arrived = (t_arrive <= t_sec)
-    remain[arrived] = 0.0
-    remain = remain.reshape(ny, nx)
-
-    # deposit arrived mass as capped disks at piles
-    acc = deposit_piles_disk(centers, info["per_pile"], t_sec, nx, ny, xs, ys, RHO_CAP, Acell)
-    return remain + acc
-
-def density_snapshot_front_sweep_spread(t_sec):
-    return band_snapshot_with_cap(t_sec, rows_per, mass_per_row_init, T_steps, RHO_CAP)
-
-# =========================
-# 9) Animate
+# 11) Animate
 # =========================
 fig, axes = plt.subplots(2, 2, figsize=(11, 8.5), constrained_layout=True)
 axes = axes.ravel()
-
-# Color scaling:
-# We keep vmin=0 and set per-panel vmax so initial yard is visible and piles/band reach orange/red.
-# Use max(initial peak, RHO_CAP) so the hottest colors are reserved for piled regions.
-vmax_panels = [
-    max(float(rho_init.max()), RHO_CAP),
-    max(float(rho_init.max()), RHO_CAP),
-    max(float(rho_init.max()), RHO_CAP),
-    max(float(rho_init.max()), RHO_CAP),
-]
-
+vmax_panels = [max(float(rho_init.max()), RHO_CAP)] * 4
 ims = []
+
 for i, ax in enumerate(axes):
     if i == 1:
-        img0 = band_snapshot_with_spillage(0.0, rows_per, mass_per_row_init, T_steps, RHO_CAP)
+        img0 = density_snapshot_front_sweep_with_bagging(0.0)
     else:
-        img0 = density_snapshot_outside_in_spread(i, 0.0)
+        img0 = density_snapshot_outside_in_with_bagging(i, 0.0)
     im = ax.imshow(
         img0, origin="lower", extent=[0, L, 0, W], aspect="auto",
         cmap=CMAP, norm=Normalize(vmin=0.0, vmax=vmax_panels[i])
     )
     fig.colorbar(im, ax=ax, shrink=0.85, label="lb/ft$^2$")
-    # overlay pile centers
-    if i != 1:
-        centers = centers_list[i]
-        if centers.size:
-            ax.scatter(centers[:, 0], centers[:, 1], s=30, c="#2b8cbe", marker="x", linewidths=1.5)
+    if i != 1 and centers_list[i].size:
+        ax.scatter(centers_list[i][:, 0], centers_list[i][:, 1], s=28, c="#2b8cbe", marker="x", linewidths=1.4)
     ax.set_title(PANEL_TITLES[i], fontsize=10)
     ax.set_xlabel("x (ft)")
     ax.set_ylabel("y (ft)")
@@ -530,19 +576,19 @@ suptitle = fig.suptitle("Minute 0", fontsize=14)
 
 def update(frame_idx):
     t_sec = frame_idx * SECONDS_PER_FRAME
-    ims[0].set_data(density_snapshot_outside_in_spread(0, t_sec))
-    ims[1].set_data(density_snapshot_front_sweep_spread(t_sec))
-    ims[2].set_data(density_snapshot_outside_in_spread(2, t_sec))
-    ims[3].set_data(density_snapshot_outside_in_spread(3, t_sec))
+    ims[0].set_data(density_snapshot_outside_in_with_bagging(0, t_sec))
+    ims[1].set_data(density_snapshot_front_sweep_with_bagging(t_sec))
+    ims[2].set_data(density_snapshot_outside_in_with_bagging(2, t_sec))
+    ims[3].set_data(density_snapshot_outside_in_with_bagging(3, t_sec))
     suptitle.set_text(f"Minute {frame_idx} / {total_minutes}")
     return (*ims, suptitle)
 
 anim = FuncAnimation(fig, update, frames=n_frames, interval=1000 / FPS, blit=False, repeat=True)
 
-# Show interactively
-plt.show(block=False)
+if SHOW_WINDOW:
+    plt.show(block=False)
 
-# Save
+# Save MP4 (fallback GIF)
 if SAVE_OUTPUT:
     try:
         writer = FFMpegWriter(fps=FPS)
@@ -554,4 +600,7 @@ if SAVE_OUTPUT:
         anim.save(str(gif_path), writer=PillowWriter(fps=FPS))
         print(f"Saved animation to {gif_path}")
 
-plt.show()
+if SHOW_WINDOW:
+    plt.show()
+else:
+    plt.close(fig)

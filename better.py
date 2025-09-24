@@ -39,6 +39,8 @@ SHOW_WINDOW = True
 
 OUT_DIR = Path("./outputs"); OUT_DIR.mkdir(exist_ok=True)
 OUT_PATH = OUT_DIR / "heatmaps_2x2.mp4"
+OUT_GIF_MINIMAL = OUT_DIR / "heatmaps_2x2_minimal.gif"
+EXPORT_FIGSIZE = (10.5, 8.0)
 
 # Colormap
 COLORS = ["#edf8e9", "#a1d99b", "#31a354", "#fed976", "#fd8d3c", "#e31a1c"]
@@ -585,8 +587,18 @@ btn_apply = Button(bax, "Apply", color="#dddddd", hovercolor="#cccccc")
 # Stats text box
 stats_text = ax_ctrl.text(0.0, 0.28, "", transform=ax_ctrl.transAxes, fontsize=10, family="monospace", va="top")
 
+# Minimal snapshot helper shared by both figures
+def panel_snapshots(t_sec):
+    return [
+        density_snapshot_outside_in(0, t_sec),
+        density_snapshot_front_sweep(t_sec),
+        density_snapshot_outside_in(2, t_sec),
+        density_snapshot_outside_in(3, t_sec),
+    ]
+
 # Initialize panels
 vmax_panels = [max(float(rho_init.max()), RHO_CAP)]*4
+initial_frames = panel_snapshots(0.0)
 ims = []
 titles = [
     "BF-centers (outside-in)",
@@ -595,8 +607,8 @@ titles = [
     "Optimization (discrete K≤5)",
 ]
 for i, ax in enumerate(axes):
-    img0 = density_snapshot_front_sweep(0.0) if i==1 else density_snapshot_outside_in(i, 0.0)
-    im = ax.imshow(img0, origin="lower", extent=[0,L,0,W], aspect="auto",
+    data0 = initial_frames[i]
+    im = ax.imshow(data0, origin="lower", extent=[0,L,0,W], aspect="auto",
                    cmap=CMAP, norm=Normalize(vmin=0.0, vmax=vmax_panels[i]))
     fig.colorbar(im, ax=ax, shrink=0.85, label="lb/ft$^2$")
     if i!=1 and centers_list[i].size:
@@ -605,7 +617,8 @@ for i, ax in enumerate(axes):
     ax.set_xlabel("x (ft)"); ax.set_ylabel("y (ft)")
     ims.append(im)
 
-suptitle = fig.suptitle("Minute 0", fontsize=14)
+main_title = fig.suptitle("Comparing leaf raking strategies", fontsize=15)
+time_text = fig.text(0.98, 0.965, f"Minute 0 / {total_minutes}", ha="right", va="top", fontsize=12)
 
 def refresh_stats():
     totals = panel_totals_seconds()
@@ -622,14 +635,43 @@ refresh_stats()
 def update(frame_idx):
     # seconds from start
     t_sec = frame_idx * SECONDS_PER_FRAME
-    ims[0].set_data(density_snapshot_outside_in(0, t_sec))
-    ims[1].set_data(density_snapshot_front_sweep(t_sec))
-    ims[2].set_data(density_snapshot_outside_in(2, t_sec))
-    ims[3].set_data(density_snapshot_outside_in(3, t_sec))
-    suptitle.set_text(f"Minute {frame_idx} / {total_minutes}")
-    return (*ims, suptitle)
+    frames = panel_snapshots(t_sec)
+    for im_obj, data in zip(ims, frames):
+        im_obj.set_data(data)
+    time_text.set_text(f"Minute {frame_idx} / {total_minutes}")
+    return (*ims, time_text)
+
+# Minimal export figure (2x2 only)
+export_fig, export_axes = plt.subplots(2, 2, figsize=EXPORT_FIGSIZE, constrained_layout=True)
+export_axes = export_axes.ravel()
+export_ims = []
+export_titles = ["BF-centers", "Front sweep", "Micro-piles", "Optimization"]
+for i, ax in enumerate(export_axes):
+    data0 = initial_frames[i]
+    im = ax.imshow(data0, origin="lower", extent=[0, L, 0, W], aspect="auto",
+                   cmap=CMAP, norm=Normalize(vmin=0.0, vmax=vmax_panels[i]))
+    if i != 1 and centers_list[i].size:
+        ax.scatter(centers_list[i][:, 0], centers_list[i][:, 1], s=28, c="#2b8cbe", marker="x", linewidths=1.4)
+    ax.set_title(export_titles[i], fontsize=11)
+    ax.set_xlabel("x (ft)"); ax.set_ylabel("y (ft)")
+    export_ims.append(im)
+
+export_cbar = export_fig.colorbar(export_ims[0], ax=export_axes, fraction=0.035, pad=0.04)
+export_cbar.set_label("lb/ft$^2$")
+export_main_title = export_fig.suptitle("Comparing leaf raking strategies", fontsize=15)
+export_time_text = export_fig.text(0.98, 0.965, f"Minute 0 / {total_minutes}", ha="right", va="top", fontsize=12)
+
+def update_export(frame_idx):
+    t_sec = frame_idx * SECONDS_PER_FRAME
+    frames = panel_snapshots(t_sec)
+    for im_obj, data in zip(export_ims, frames):
+        im_obj.set_data(data)
+    export_time_text.set_text(f"Minute {frame_idx} / {total_minutes}")
+    return (*export_ims, export_time_text)
 
 anim = FuncAnimation(fig, update, frames=n_frames, interval=1000/FPS, blit=False, repeat=True)
+export_anim = FuncAnimation(export_fig, update_export, frames=n_frames, interval=1000/FPS, blit=False, repeat=True)
+EXPORT_FIG_ACTIVE = True
 
 # === UI callbacks ===
 def on_apply(event):
@@ -643,6 +685,15 @@ def on_apply(event):
     band_cum = None  # reset prefix sums for band bagging
     recompute_front_sweep()
     refresh_stats()
+    frames0 = panel_snapshots(0.0)
+    for im_obj, data in zip(ims, frames0):
+        im_obj.set_data(data)
+    time_text.set_text(f"Minute 0 / {total_minutes}")
+    if EXPORT_FIG_ACTIVE:
+        for im_obj, data in zip(export_ims, frames0):
+            im_obj.set_data(data)
+        export_time_text.set_text(f"Minute 0 / {total_minutes}")
+        export_fig.canvas.draw_idle()
     fig.canvas.draw_idle()
 
 btn_apply.on_clicked(on_apply)
@@ -656,8 +707,17 @@ if SAVE_OUTPUT:
     except Exception as e:
         gif_path = OUT_DIR / "heatmaps_2x2.gif"
         print("FFmpeg not available or failed; saving GIF instead...", e)
-        anim.save(str(gif_path), writer=PillowWriter(fps=FPS))
+        anim.save(str(gif_path), writer=PillowWriter(fps=FPS), dpi=150)
         print(f"Saved animation to {gif_path}")
+    try:
+        export_anim.save(str(OUT_GIF_MINIMAL), writer=PillowWriter(fps=FPS), dpi=150)
+        print(f"Saved minimal GIF to {OUT_GIF_MINIMAL}")
+    except Exception as e:
+        print("Failed to save minimal GIF:", e)
+
+# Do not show the export-only figure in interactive mode
+plt.close(export_fig)
+EXPORT_FIG_ACTIVE = False
 
 if SHOW_WINDOW:
     plt.show()

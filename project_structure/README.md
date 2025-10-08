@@ -23,3 +23,5 @@ The original `with_bagging.py` logic was lifted into reusable pieces under `src/
 - `animations/with_bagging.py` – packaged version of the legacy animation that imports the shared pieces.
 
 `with_bagging.py` in the project root remains unchanged for reference, so you can diff behaviour as you continue migrating.
+
+TODO: Restructure so that the new files added are included
